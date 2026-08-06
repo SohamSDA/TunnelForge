@@ -1,4 +1,17 @@
-node_modules
+# Compiled binaries
+/relay
+/tunnelforge
+/bin/
+*.exe
+*.test
+
+# Test and coverage output
+coverage.out
+
+# Local configuration
 .env
 
-  
+# Editor and operating-system files
+.DS_Store
+.vscode/
+.idea/
