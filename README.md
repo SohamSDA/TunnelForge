@@ -109,3 +109,140 @@ TunnelForge/
 - `integration` will test the complete request path.
 
 
+## Current status
+
+Phases 1 through 4 of the Go rewrite are complete.
+
+Currently implemented:
+
+- Relay executable with an HTTP health endpoint and server timeouts
+- CLI parsing and validation for the local host, port, relay WebSocket URL, and version output
+- A versioned and validated JSON protocol for registration, HTTP forwarding, heartbeats, and errors
+- Binary-safe HTTP request and response payloads with bounded bodies
+- A concurrency-safe tunnel registry with secure random IDs and disconnect cleanup
+- Bounded pending-request coordination with secure IDs, response correlation, timeouts, cancellation, and cleanup
+- Unit and concurrency tests that pass under Go's race detector
+
+Expected health response:
+
+```json
+{"status":"ok"}
+```
+
+Public HTTP routing, WebSocket transport, localhost forwarding, and end-to-end integration tests are the next implementation phases. The CLI currently validates and prints its configuration but does not connect to the relay yet.
+
+## Run the current relay
+
+Start the relay:
+
+```bash
+go run ./cmd/relay
+```
+
+In another terminal, check its health:
+
+```bash
+curl -i http://localhost:8080/health
+```
+
+The response should include:
+
+```text
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+{"status":"ok"}
+```
+
+Stop the server with `Ctrl+C`.
+
+Validate CLI configuration:
+
+```bash
+go run ./cmd/tunnelforge --relay ws://localhost:8080/tunnels 3000
+```
+
+## Development checks
+
+Format the code:
+
+```bash
+gofmt -w .
+```
+
+Run static analysis:
+
+```bash
+go vet ./...
+```
+
+Run tests:
+
+```bash
+go test ./...
+```
+
+Later, concurrency-sensitive code will also be tested with:
+
+```bash
+go test -race ./...
+```
+
+## Development roadmap
+
+### Phase 1: Go foundations
+
+- Build the relay health server
+- Build a CLI that reads and validates a local port
+- Learn packages, functions, imports, structs, pointers, errors, and basic HTTP
+
+### Phase 2: Shared protocol
+
+- Define versioned registration, HTTP request, HTTP response, heartbeat, and error messages
+- Learn custom types, constants, JSON encoding, validation, and table-driven tests
+
+### Phase 3: Tunnel registry
+
+- Associate generated subdomains with connected tunnel clients
+- Learn maps, methods, pointers, mutexes, and secure random identifiers
+
+### Phase 4: Pending request coordination
+
+- Match concurrent HTTP responses to their original requests
+- Learn goroutines, channels, `select`, timers, contexts, and cleanup
+
+### Phase 5: Public HTTP routing
+
+- Accept requests for registered tunnel subdomains
+- Forward methods, paths, query strings, headers, and bounded bodies
+- Test handlers using `httptest`
+
+### Phase 6: Relay WebSocket transport
+
+- Register CLI connections
+- Implement one read pump and one write pump per connection
+- Add heartbeat handling, limits, and disconnect cleanup
+
+### Phase 7: Local HTTP forwarding
+
+- Recreate tunneled requests against the developer's localhost application
+- Return local status codes, headers, and response bodies
+
+### Phase 8: Complete CLI lifecycle
+
+- Add command-line options, reconnection, exponential backoff, signal handling, and graceful shutdown
+
+### Phase 9: End-to-end testing
+
+- Prove the complete visitor-to-localhost round trip
+- Test concurrency, binary data, timeouts, cancellation, disconnects, and reconnection
+
+### Phase 10: Production foundation
+
+- Add HTTPS/WSS, wildcard DNS, authentication, rate limiting, observability, deployment, and release binaries
+
+Streaming, application WebSocket proxying, large uploads, multiple relay nodes, reserved domains, and dashboards are deliberately outside the initial MVP.
+
+## Learning objective
+
+The project is not only intended to produce a working tunnel. Each phase is designed to explain why a component exists, which Go features it requires, how it should be tested, and how it participates in the complete system.
