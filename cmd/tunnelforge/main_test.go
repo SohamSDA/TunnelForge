@@ -2,8 +2,12 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"strings"
 	"testing"
+
+	"github.com/SohamSDA/TunnelForge/internal/client"
+	"github.com/SohamSDA/TunnelForge/internal/protocol"
 )
 
 func TestParseConfig(t *testing.T) {
@@ -44,7 +48,7 @@ func TestParseConfig(t *testing.T) {
 
 func TestRunVersion(t *testing.T) {
 	var stdout, stderr bytes.Buffer
-	if code := run([]string{"--version"}, &stdout, &stderr); code != 0 {
+	if code := run(context.Background(), []string{"--version"}, &stdout, &stderr, nil); code != 0 {
 		t.Fatalf("run() code = %d, stderr = %q", code, stderr.String())
 	}
 	if got := stdout.String(); !strings.Contains(got, "tunnelforge dev") {
@@ -54,7 +58,11 @@ func TestRunVersion(t *testing.T) {
 
 func TestRunValidConfiguration(t *testing.T) {
 	var stdout, stderr bytes.Buffer
-	if code := run([]string{"3000"}, &stdout, &stderr); code != 0 {
+	connect := func(_ context.Context, configuration client.Config) error {
+		configuration.OnReady(protocol.Registered{TunnelID: "test", URL: "https://test.example.com"})
+		return nil
+	}
+	if code := run(context.Background(), []string{"3000"}, &stdout, &stderr, connect); code != 0 {
 		t.Fatalf("run() code = %d, stderr = %q", code, stderr.String())
 	}
 	if got := stdout.String(); !strings.Contains(got, "http://localhost:3000") {

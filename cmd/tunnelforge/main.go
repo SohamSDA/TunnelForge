@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"fmt"
@@ -8,7 +9,12 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"os/signal"
 	"strconv"
+	"syscall"
+
+	"github.com/SohamSDA/TunnelForge/internal/client"
+	"github.com/SohamSDA/TunnelForge/internal/protocol"
 )
 
 const version = "dev"
@@ -17,6 +23,7 @@ type config struct {
 	localHost string
 	localPort uint16
 	relayURL  *url.URL
+	token     string
 }
 
 func parseConfig(args []string, stderr io.Writer) (config, bool, error) {
@@ -26,6 +33,7 @@ func parseConfig(args []string, stderr io.Writer) (config, bool, error) {
 	localHost := flags.String("host", "localhost", "local application hostname")
 	relayAddress := flags.String("relay", "ws://localhost:8080/tunnels", "TunnelForge relay WebSocket URL")
 	showVersion := flags.Bool("version", false, "print the TunnelForge version")
+	token := flags.String("token", os.Getenv("TUNNELFORGE_TOKEN"), "relay authentication token (or TUNNELFORGE_TOKEN)")
 	flags.Usage = func() {
 		fmt.Fprintf(stderr, "Usage: tunnelforge [options] <port>\n\nOptions:\n")
 		flags.PrintDefaults()
@@ -55,7 +63,7 @@ func parseConfig(args []string, stderr io.Writer) (config, bool, error) {
 		return config{}, false, fmt.Errorf("invalid relay URL %q: expected ws:// or wss:// URL", *relayAddress)
 	}
 
-	return config{localHost: *localHost, localPort: uint16(port), relayURL: relayURL}, false, nil
+	return config{localHost: *localHost, localPort: uint16(port), relayURL: relayURL, token: *token}, false, nil
 }
 
 func validHostname(host string) bool {
@@ -88,9 +96,14 @@ func splitHost(host string) []string {
 	return append(labels, host[start:])
 }
 
-func run(args []string, stdout, stderr io.Writer) int {
+type connector func(context.Context, client.Config) error
+
+func run(ctx context.Context, args []string, stdout, stderr io.Writer, connect connector) int {
 	configuration, showVersion, err := parseConfig(args, stderr)
 	if err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
 		fmt.Fprintf(stderr, "tunnelforge: %v\n", err)
 		return 2
 	}
@@ -102,10 +115,21 @@ func run(args []string, stdout, stderr io.Writer) int {
 	localAddress := net.JoinHostPort(configuration.localHost, strconv.Itoa(int(configuration.localPort)))
 	fmt.Fprintf(stdout, "Local application: http://%s\n", localAddress)
 	fmt.Fprintf(stdout, "Relay: %s\n", configuration.relayURL)
-	fmt.Fprintln(stdout, "Tunnel transport is not available yet; configuration is valid.")
+	err = connect(ctx, client.Config{
+		LocalHost: configuration.localHost, LocalPort: configuration.localPort, RelayURL: configuration.relayURL, Token: configuration.token,
+		OnReady: func(tunnel protocol.Registered) {
+			fmt.Fprintf(stdout, "Forwarding: %s -> http://%s\n", tunnel.URL, localAddress)
+		},
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "tunnelforge: %v\n", err)
+		return 1
+	}
 	return 0
 }
 
 func main() {
-	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	os.Exit(run(ctx, os.Args[1:], os.Stdout, os.Stderr, client.Run))
 }
