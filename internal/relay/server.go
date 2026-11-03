@@ -2,6 +2,7 @@ package relay
 
 import (
 	"context"
+	"crypto/subtle"
 	"errors"
 	"fmt"
 	"io"
@@ -43,9 +44,14 @@ func WithPathRouting() Option {
 	return func(server *Server) { server.pathRouting = true }
 }
 
+// WithRequestTimeout controls the lifetime of each request, including queueing.
+func WithRequestTimeout(timeout time.Duration) Option {
+	return func(server *Server) { server.pending.requestTimeout = timeout }
+}
+
 func NewServer(publicURL, token string, logger *log.Logger, options ...Option) (*Server, error) {
 	parsedURL, err := url.Parse(publicURL)
-	if err != nil || parsedURL.Scheme == "" || parsedURL.Host == "" {
+	if err != nil || (parsedURL.Scheme != "http" && parsedURL.Scheme != "https") || parsedURL.Host == "" || parsedURL.User != nil || parsedURL.RawQuery != "" || parsedURL.Fragment != "" || (parsedURL.Path != "" && parsedURL.Path != "/") {
 		return nil, fmt.Errorf("invalid public URL %q", publicURL)
 	}
 	pending, err := NewPendingRequests(1000, 30*time.Second)
@@ -62,10 +68,13 @@ func NewServer(publicURL, token string, logger *log.Logger, options ...Option) (
 		token:     token,
 		logger:    logger,
 		clients:   make(map[string]messageSender),
-		upgrade:   websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }},
+		upgrade:   websocket.Upgrader{},
 	}
 	for _, option := range options {
 		option(server)
+	}
+	if server.pending.requestTimeout <= 0 {
+		return nil, errors.New("request timeout must be positive")
 	}
 	return server, nil
 }
@@ -93,7 +102,7 @@ func (server *Server) TunnelHandler(w http.ResponseWriter, request *http.Request
 		server.sendProtocolError(client, "INVALID_REGISTRATION", err.Error())
 		return
 	}
-	if server.token != "" && registration.Token != server.token {
+	if server.token != "" && subtle.ConstantTimeCompare([]byte(registration.Token), []byte(server.token)) != 1 {
 		server.sendProtocolError(client, "UNAUTHORIZED", "invalid tunnel token")
 		return
 	}
@@ -127,7 +136,7 @@ func (server *Server) TunnelHandler(w http.ResponseWriter, request *http.Request
 		case protocol.TypeHTTPResponse:
 			var response protocol.HTTPResponse
 			if message.PayloadAs(&response) == nil {
-				_ = server.pending.Resolve(message.RequestID, response)
+				_ = server.pending.ResolveFor(tunnel.ID, message.RequestID, response)
 			}
 		case protocol.TypeHeartbeat:
 			// Receiving the message is enough to prove application-level liveness.
@@ -167,13 +176,25 @@ func (server *Server) PublicHandler(w http.ResponseWriter, request *http.Request
 		Headers: protocol.Headers(request.Header), Body: body,
 	}
 	removeHopByHop(forwarded.Headers)
+	forwarded.Headers["X-Forwarded-Host"] = []string{request.Host}
+	scheme := "http"
+	if request.TLS != nil || server.publicURL.Scheme == "https" {
+		scheme = "https"
+	}
+	forwarded.Headers["X-Forwarded-Proto"] = []string{scheme}
+	if host, _, err := net.SplitHostPort(request.RemoteAddr); err == nil {
+		forwarded.Headers["X-Forwarded-For"] = []string{host}
+	}
+	forwarded.Headers["X-Request-Id"] = []string{requestID}
 	message, err := protocol.NewMessage(protocol.TypeHTTPRequest, requestID, forwarded)
 	if err != nil {
 		_ = server.pending.Cancel(requestID, err)
 		http.Error(w, "Invalid request", http.StatusBadRequest)
 		return
 	}
-	if err := client.Send(request.Context(), message); err != nil {
+	sendContext, cancelSend := context.WithTimeout(request.Context(), server.pending.requestTimeout)
+	defer cancelSend()
+	if err := client.Send(sendContext, message); err != nil {
 		_ = server.pending.Cancel(requestID, err)
 		http.Error(w, "Tunnel unavailable", http.StatusBadGateway)
 		return
@@ -181,6 +202,10 @@ func (server *Server) PublicHandler(w http.ResponseWriter, request *http.Request
 
 	outcome := <-result
 	if outcome.Err != nil {
+		cancelMessage, _ := protocol.NewMessage(protocol.TypeCancel, requestID, struct{}{})
+		cancelContext, cancel := context.WithTimeout(context.Background(), time.Second)
+		_ = client.Send(cancelContext, cancelMessage)
+		cancel()
 		if errors.Is(outcome.Err, context.DeadlineExceeded) {
 			http.Error(w, "Tunnel timed out", http.StatusGatewayTimeout)
 		} else if request.Context().Err() == nil {
@@ -194,6 +219,7 @@ func (server *Server) PublicHandler(w http.ResponseWriter, request *http.Request
 			w.Header().Add(key, value)
 		}
 	}
+	w.Header().Set("X-Request-Id", requestID)
 	w.WriteHeader(outcome.Response.StatusCode)
 	_, _ = w.Write(outcome.Response.Body)
 }
@@ -262,12 +288,16 @@ func (server *Server) disconnect(clientID string) {
 func (server *Server) sendProtocolError(client messageSender, code, text string) {
 	message, err := protocol.NewMessage(protocol.TypeError, "", protocol.Error{Code: code, Message: text})
 	if err == nil {
-		_ = client.Send(context.Background(), message)
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		if socket, ok := client.(*websocketClient); ok {
+			_ = socket.SendAndWait(ctx, message)
+		} else {
+			_ = client.Send(ctx, message)
+		}
 	}
 }
 
 func removeHopByHop(headers map[string][]string) {
-	for _, key := range []string{"Connection", "Proxy-Connection", "Keep-Alive", "Proxy-Authenticate", "Proxy-Authorization", "Te", "Trailer", "Transfer-Encoding", "Upgrade"} {
-		delete(headers, key)
-	}
+	protocol.RemoveHopByHop(headers)
 }

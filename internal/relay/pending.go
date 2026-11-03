@@ -90,6 +90,20 @@ func (pending *PendingRequests) Resolve(requestID string, response protocol.HTTP
 	return pending.complete(requestID, Outcome{Response: response})
 }
 
+// ResolveFor prevents one connection from completing another tunnel's request.
+func (pending *PendingRequests) ResolveFor(tunnelID, requestID string, response protocol.HTTPResponse) error {
+	pending.mu.Lock()
+	defer pending.mu.Unlock()
+	request, ok := pending.requests[requestID]
+	if !ok || request.tunnelID != tunnelID {
+		return ErrPendingNotFound
+	}
+	delete(pending.requests, requestID)
+	request.result <- Outcome{Response: response}
+	request.cancel()
+	return nil
+}
+
 func (pending *PendingRequests) Cancel(requestID string, reason error) error {
 	if reason == nil {
 		reason = context.Canceled

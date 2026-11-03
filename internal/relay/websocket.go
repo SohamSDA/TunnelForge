@@ -14,13 +14,18 @@ import (
 
 type websocketClient struct {
 	connection *websocket.Conn
-	queue      chan protocol.Message
+	queue      chan outbound
 	done       chan struct{}
 	closeOnce  sync.Once
 }
 
+type outbound struct {
+	message protocol.Message
+	written chan error
+}
+
 func newWebSocketClient(connection *websocket.Conn) *websocketClient {
-	client := &websocketClient{connection: connection, queue: make(chan protocol.Message, maxClientQueue), done: make(chan struct{})}
+	client := &websocketClient{connection: connection, queue: make(chan outbound, maxClientQueue), done: make(chan struct{})}
 	connection.SetReadLimit(protocol.MaxMessageBytes)
 	_ = connection.SetReadDeadline(time.Now().Add(60 * time.Second))
 	connection.SetPongHandler(func(string) error { return connection.SetReadDeadline(time.Now().Add(60 * time.Second)) })
@@ -30,8 +35,28 @@ func newWebSocketClient(connection *websocket.Conn) *websocketClient {
 
 func (client *websocketClient) Send(ctx context.Context, message protocol.Message) error {
 	select {
-	case client.queue <- message:
+	case client.queue <- outbound{message: message}:
 		return nil
+	case <-client.done:
+		return errors.New("client disconnected")
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// SendAndWait flushes terminal errors before the handler closes the socket.
+func (client *websocketClient) SendAndWait(ctx context.Context, message protocol.Message) error {
+	written := make(chan error, 1)
+	select {
+	case client.queue <- outbound{message: message, written: written}:
+	case <-client.done:
+		return errors.New("client disconnected")
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	select {
+	case err := <-written:
+		return err
 	case <-client.done:
 		return errors.New("client disconnected")
 	case <-ctx.Done():
@@ -59,10 +84,16 @@ func (client *websocketClient) writePump() {
 	defer ticker.Stop()
 	for {
 		select {
-		case message := <-client.queue:
+		case item := <-client.queue:
 			_ = client.connection.SetWriteDeadline(time.Now().Add(10 * time.Second))
-			encoded, err := json.Marshal(message)
-			if err != nil || client.connection.WriteMessage(websocket.TextMessage, encoded) != nil {
+			encoded, err := json.Marshal(item.message)
+			if err == nil {
+				err = client.connection.WriteMessage(websocket.TextMessage, encoded)
+			}
+			if item.written != nil {
+				item.written <- err
+			}
+			if err != nil {
 				client.Close()
 				return
 			}

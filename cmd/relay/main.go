@@ -31,7 +31,14 @@ func main() {
 	logger := log.New(os.Stdout, "", log.LstdFlags|log.LUTC)
 	publicURL := env("TUNNELFORGE_PUBLIC_URL", "http://localhost:8080")
 	var options []relay.Option
-	if env("TUNNELFORGE_ROUTING_MODE", "subdomain") == "path" {
+	routingMode := env("TUNNELFORGE_ROUTING_MODE", "path")
+	if routingMode != "path" && routingMode != "subdomain" {
+		logger.Fatal("TUNNELFORGE_ROUTING_MODE must be path or subdomain")
+	}
+	if os.Getenv("TUNNELFORGE_TOKEN") == "" {
+		logger.Fatal("TUNNELFORGE_TOKEN is required")
+	}
+	if routingMode == "path" {
 		options = append(options, relay.WithPathRouting())
 	}
 	tunnelServer, err := relay.NewServer(publicURL, os.Getenv("TUNNELFORGE_TOKEN"), logger, options...)

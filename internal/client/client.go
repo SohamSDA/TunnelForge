@@ -30,10 +30,20 @@ type Config struct {
 var ErrRejected = errors.New("relay rejected connection")
 
 func Run(ctx context.Context, configuration Config) error {
+	if configuration.RelayURL == nil || (configuration.RelayURL.Scheme != "ws" && configuration.RelayURL.Scheme != "wss") || configuration.RelayURL.Host == "" || configuration.LocalHost == "" || configuration.LocalPort == 0 {
+		return errors.New("valid relay URL, local hostname and port are required")
+	}
 	if configuration.Logger == nil {
 		configuration.Logger = log.Default()
 	}
 	delay := time.Second
+	onReady := configuration.OnReady
+	configuration.OnReady = func(registered protocol.Registered) {
+		delay = time.Second
+		if onReady != nil {
+			onReady(registered)
+		}
+	}
 	for {
 		err := runOnce(ctx, configuration)
 		if ctx.Err() != nil {
@@ -52,11 +62,16 @@ func Run(ctx context.Context, configuration Config) error {
 		}
 		if delay < 30*time.Second {
 			delay *= 2
+			if delay > 30*time.Second {
+				delay = 30 * time.Second
+			}
 		}
 	}
 }
 
 func runOnce(ctx context.Context, configuration Config) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	connection, _, err := websocket.DefaultDialer.DialContext(ctx, configuration.RelayURL.String(), nil)
 	if err != nil {
 		return err
@@ -73,6 +88,11 @@ func runOnce(ctx context.Context, configuration Config) error {
 		}
 	}()
 	connection.SetReadLimit(protocol.MaxMessageBytes)
+	_ = connection.SetReadDeadline(time.Now().Add(60 * time.Second))
+	connection.SetPingHandler(func(data string) error {
+		_ = connection.SetReadDeadline(time.Now().Add(60 * time.Second))
+		return connection.WriteControl(websocket.PongMessage, []byte(data), time.Now().Add(10*time.Second))
+	})
 
 	writer := &safeWriter{connection: connection}
 	registration, err := protocol.NewMessage(protocol.TypeRegister, "", protocol.RegisterRequest{Token: configuration.Token})
@@ -112,25 +132,55 @@ func runOnce(ctx context.Context, configuration Config) error {
 	go heartbeat(ctx, writer, heartbeatDone)
 
 	localAddress := net.JoinHostPort(configuration.LocalHost, strconv.Itoa(int(configuration.LocalPort)))
-	localClient := &http.Client{Timeout: 30 * time.Second}
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.Proxy = nil
+	transport.DisableCompression = true
+	defer transport.CloseIdleConnections()
+	localClient := &http.Client{Timeout: 35 * time.Second, Transport: transport,
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
 	semaphore := make(chan struct{}, 64)
+	var activeMu sync.Mutex
+	active := make(map[string]context.CancelFunc)
 	for {
 		_, encoded, err := connection.ReadMessage()
 		if err != nil {
 			return err
 		}
 		message, err := protocol.Decode(bytes.NewReader(encoded))
-		if err != nil || message.Type != protocol.TypeHTTPRequest {
+		if err != nil {
+			return err
+		}
+		if message.Type == protocol.TypeCancel {
+			activeMu.Lock()
+			if stop := active[message.RequestID]; stop != nil {
+				stop()
+			}
+			activeMu.Unlock()
+			continue
+		}
+		if message.Type != protocol.TypeHTTPRequest {
 			continue
 		}
 		select {
 		case semaphore <- struct{}{}:
-		case <-ctx.Done():
-			return nil
+		default:
+			writeForwardError(writer, message.RequestID, http.StatusServiceUnavailable, errors.New("local tunnel concurrency limit reached"))
+			continue
 		}
+		requestContext, stop := context.WithCancel(ctx)
+		activeMu.Lock()
+		active[message.RequestID] = stop
+		activeMu.Unlock()
 		go func() {
-			defer func() { <-semaphore }()
-			forward(ctx, localClient, localAddress, writer, message)
+			defer func() {
+				stop()
+				activeMu.Lock()
+				delete(active, message.RequestID)
+				activeMu.Unlock()
+				<-semaphore
+			}()
+			forward(requestContext, localClient, localAddress, writer, message)
 		}()
 	}
 }
@@ -216,7 +266,5 @@ func cloneHeaders(headers map[string][]string) http.Header {
 }
 
 func removeHopByHop(headers map[string][]string) {
-	for _, key := range []string{"Connection", "Proxy-Connection", "Keep-Alive", "Proxy-Authenticate", "Proxy-Authorization", "Te", "Trailer", "Transfer-Encoding", "Upgrade"} {
-		delete(headers, key)
-	}
+	protocol.RemoveHopByHop(headers)
 }

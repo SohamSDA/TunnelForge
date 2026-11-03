@@ -17,7 +17,7 @@ import (
 	"github.com/SohamSDA/TunnelForge/internal/protocol"
 )
 
-const version = "dev"
+var version = "dev"
 
 type config struct {
 	localHost string

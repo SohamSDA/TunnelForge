@@ -1,0 +1,10 @@
+services:
+  relay:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      PORT: "8080"
+      TUNNELFORGE_PUBLIC_URL: "http://localhost:8080"
+      TUNNELFORGE_ROUTING_MODE: "path"
+      TUNNELFORGE_TOKEN: "local-development-token"

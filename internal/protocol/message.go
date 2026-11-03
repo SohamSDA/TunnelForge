@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 )
 
 const (
@@ -25,6 +26,7 @@ const (
 	TypeHTTPResponse MessageType = "http_response"
 	TypeHeartbeat    MessageType = "heartbeat"
 	TypeError        MessageType = "error"
+	TypeCancel       MessageType = "cancel"
 )
 
 var (
@@ -111,7 +113,7 @@ func (message Message) Validate() error {
 	if len(message.Payload) == 0 || bytes.Equal(message.Payload, []byte("null")) {
 		return fmt.Errorf("%w: payload is required", ErrInvalidMessage)
 	}
-	requestScoped := message.Type == TypeHTTPRequest || message.Type == TypeHTTPResponse
+	requestScoped := message.Type == TypeHTTPRequest || message.Type == TypeHTTPResponse || message.Type == TypeCancel
 	if requestScoped && message.RequestID == "" {
 		return fmt.Errorf("%w: request_id is required for %s", ErrInvalidMessage, message.Type)
 	}
@@ -135,6 +137,8 @@ func (message Message) PayloadAs(destination any) error {
 
 func (message Message) validatePayload() error {
 	switch message.Type {
+	case TypeCancel:
+		return message.PayloadAs(&struct{}{})
 	case TypeRegister:
 		var payload RegisterRequest
 		return message.PayloadAs(&payload)
@@ -185,7 +189,7 @@ func (message Message) validatePayload() error {
 
 func validType(messageType MessageType) bool {
 	switch messageType {
-	case TypeRegister, TypeRegistered, TypeHTTPRequest, TypeHTTPResponse, TypeHeartbeat, TypeError:
+	case TypeRegister, TypeRegistered, TypeHTTPRequest, TypeHTTPResponse, TypeHeartbeat, TypeError, TypeCancel:
 		return true
 	default:
 		return false
@@ -199,4 +203,26 @@ func Headers(headers http.Header) map[string][]string {
 		copy[key] = append([]string(nil), values...)
 	}
 	return copy
+}
+
+// RemoveHopByHop also removes headers nominated by the Connection header.
+func RemoveHopByHop(headers map[string][]string) {
+	nominated := make(map[string]bool)
+	for key, values := range headers {
+		if strings.EqualFold(key, "Connection") {
+			for _, value := range values {
+				for _, name := range strings.Split(value, ",") {
+					nominated[strings.ToLower(strings.TrimSpace(name))] = true
+				}
+			}
+		}
+	}
+	for _, name := range []string{"connection", "proxy-connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade"} {
+		nominated[name] = true
+	}
+	for key := range headers {
+		if nominated[strings.ToLower(key)] {
+			delete(headers, key)
+		}
+	}
 }
